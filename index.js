@@ -31,7 +31,7 @@ const ENDPOINTS = {
     checkin: '/points/checkin/perform',
     checkinCalendar: '/points/checkin/calendar/7',
     createOrder: '/product/orders',
-    payOrder: '/product/orders/pay',
+    payOrder: '/product/orders/pay/v2',
     activityLog: '/points/activity/createLog',
     submitReview: '/product/product/review',
     productList: '/product/product/page-for-buyer',
@@ -62,10 +62,12 @@ const TOKENS_FILE = path.join(__dirname, 'tokens.json');
 const FINGERPRINT_FILE = path.join(__dirname, 'device_fingerprints.json');
 
 // ═══════════════════════════════════════════════════════════
-// PAYMENT CONTRACT ABI (16 params)
+// PAYMENT CONTRACT ABI (17 params - purchaseWithMarketingAndPermit)
+// Server signs verifySignature hash: encodePacked(params + marketingRuleId + shopContract + buyer)
+// Then toEthSignedMessageHash + ECDSA. All successful txs use this function.
 // ═══════════════════════════════════════════════════════════
 const PAYMENT_ABI = [
-    'function paymentWithPermit(uint256 orderId, uint256 skuId, uint256 price, uint256 inventory, uint256 inventoryVersion, uint256 quantity, uint256 totalAmount, uint256 shippingFee, uint256 deadline, uint256 nonce, uint8 v, bytes32 r, bytes32 s, uint8 permitV, bytes32 permitR, bytes32 permitS) external'
+    'function purchaseWithMarketingAndPermit(uint256 _orderId, uint256 _skuId, uint256 _price, uint256 _inventory, uint256 _inventoryVersion, uint256 _quantity, uint256 _totalAmount, uint256 _shippingFee, uint256 _deadline, uint256 _nonce, uint256 _marketingRuleId, uint8 _os_v, bytes32 _os_r, bytes32 _os_s, uint8 _v, bytes32 _r, bytes32 _s) external'
 ];
 
 const NUSD_ABI = [
@@ -95,6 +97,9 @@ const PERMIT_TYPES = {
         { name: 'deadline', type: 'uint256' }
     ]
 };
+
+// Cached NUSD domain name (fetched dynamically from contract)
+let _nusdNameCache = null;
 
 // Review templates
 const REVIEW_TEMPLATES = [
@@ -211,8 +216,8 @@ function renderTable() {
 
     // Summary Table
     const table = new Table({
-        head: ['Account', 'IP', 'Status', 'Last Run', 'Next Run', 'Checkin', 'Faucet', 'Purchase', 'Review'],
-        colWidths: [12, 18, 12, 12, 12, 10, 10, 10, 10],
+        head: ['Account', 'IP', 'Status', 'Points', 'Diff', 'Last Run', 'Next Run', 'Checkin', 'Faucet', 'Purchase', 'Review'],
+        colWidths: [12, 18, 12, 10, 8, 12, 12, 10, 10, 10, 10],
         style: { head: ['cyan'], border: ['grey'] }
     });
 
@@ -235,10 +240,22 @@ function renderTable() {
             lastRunStr = new Date(acc.lastRun).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         }
 
+        let diffDisplay = '-';
+        if (acc.diffPoints !== undefined && acc.diffPoints !== null) {
+            if (typeof acc.diffPoints === 'number') {
+                const sign = acc.diffPoints >= 0 ? '+' : '';
+                diffDisplay = chalk.green(`${sign}${acc.diffPoints}`);
+            } else if (acc.diffPoints === '?') {
+                diffDisplay = chalk.yellow('?');
+            }
+        }
+
         table.push([
             `Account ${acc.index}`,
             chalk.magenta(acc.ip || 'Direct'),
             statusText,
+            acc.points !== undefined ? acc.points : '-',
+            diffDisplay,
             lastRunStr,
             nextRunStr,
             acc.checkin || '-',
@@ -640,6 +657,21 @@ async function login(apiClient, privateKey, proxy = null) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// POINTS MODULE
+// ═══════════════════════════════════════════════════════════
+async function getUserPoints(apiClient) {
+    try {
+        const response = await apiClient.get(ENDPOINTS.userInfo);
+        if (response.code === 200 && response.data) {
+            return { success: true, points: response.data.points || 0 };
+        }
+        return { success: false, error: response.message || 'Failed to fetch points' };
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 // CHECKIN MODULE
 // ═══════════════════════════════════════════════════════════
 async function performCheckin(apiClient) {
@@ -803,13 +835,15 @@ async function fetchProductDetail(apiClient, productId) {
         if (!skus || skus.length === 0) return { success: false, error: 'No SKU available' };
         const validSku = skus.find(s => s.isEnabled !== false && (s.stock > 0 || s.stock === undefined));
         if (!validSku) return { success: false, error: 'No valid SKU in stock' };
-        return { success: true, skuId: validSku.id?.toString() || validSku.id, skuPrice: parseInt(validSku.price) || 0, stock: validSku.stock };
+        return { success: true, skuId: validSku.id?.toString() || validSku.id, skuPrice: parseInt(validSku.price) || 0, stock: validSku.stock, promotionId: response.data.promotionId || null };
     } catch (error) { return { success: false, error: error.message }; }
 }
 
-async function createOrder(apiClient, skuId) {
+async function createOrder(apiClient, skuId, promotionId) {
     try {
-        const response = await apiClient.post(ENDPOINTS.createOrder, { skuId: skuId.toString(), quantity: 1, addressId: '', cartId: '' });
+        const payload = { skuId: skuId.toString(), quantity: 1, addressId: '', cartId: '' };
+        if (promotionId) payload.promotionId = promotionId;
+        const response = await apiClient.post(ENDPOINTS.createOrder, payload);
         if (response.code === 200 && response.data) return { success: true, orderId: response.data.toString() };
         return { success: false, error: response.message || response.reason || 'Failed to create order', code: response.code };
     } catch (error) { return { success: false, error: error.response?.data?.message || error.message }; }
@@ -826,9 +860,31 @@ async function getPaymentData(apiClient, orderId) {
 async function signNusdPermit(signer, spender, value, deadline) {
     const owner = await signer.getAddress();
     const nusdContract = new ethers.Contract(NUSD_CONTRACT, NUSD_ABI, signer.provider);
-    const nonce = await nusdContract.nonces(owner);
+
+    // Fetch nonce and domain name in parallel (dynamic domain name to match contract)
+    let nonce, domainName;
+    try {
+        const namePromise = _nusdNameCache
+            ? Promise.resolve(_nusdNameCache)
+            : nusdContract.name().then(n => { _nusdNameCache = n; return n; });
+        [nonce, domainName] = await Promise.all([
+            nusdContract.nonces(owner),
+            namePromise
+        ]);
+    } catch (e) {
+        // Fallback: fetch nonce only, use hardcoded domain name
+        nonce = await nusdContract.nonces(owner);
+        domainName = NUSD_PERMIT_DOMAIN.name;
+    }
+
+    // Build domain with dynamically fetched name
+    const domain = { ...NUSD_PERMIT_DOMAIN, name: domainName };
+    if (domainName !== NUSD_PERMIT_DOMAIN.name) {
+        logger.warn(`NUSD domain name mismatch: contract="${domainName}" vs hardcoded="${NUSD_PERMIT_DOMAIN.name}". Using contract value.`, { context: 'Permit' });
+    }
+
     const permitMessage = { owner, spender, value, nonce, deadline };
-    const signature = await signer.signTypedData(NUSD_PERMIT_DOMAIN, PERMIT_TYPES, permitMessage);
+    const signature = await signer.signTypedData(domain, PERMIT_TYPES, permitMessage);
     const sig = ethers.Signature.from(signature);
     return { v: sig.v, r: sig.r, s: sig.s };
 }
@@ -836,35 +892,100 @@ async function signNusdPermit(signer, spender, value, deadline) {
 async function executePaymentOnChain(privateKey, paymentData, ctx) {
     try {
         const signer = createSigner(privateKey);
+        const address = await signer.getAddress();
         const contractAddress = paymentData.address;
         const paymentContract = new ethers.Contract(contractAddress, PAYMENT_ABI, signer);
 
-        const deadline = typeof paymentData.deadline === 'string' ? parseInt(paymentData.deadline) : paymentData.deadline;
-        if (deadline && deadline < Date.now()) {
-            return { success: false, error: `Deadline expired` };
+        // Parse deadline using BigInt to avoid precision loss
+        let deadline;
+        try {
+            deadline = BigInt(paymentData.deadline);
+        } catch {
+            return { success: false, error: 'Invalid deadline in payment data' };
+        }
+
+        // Deadline validation: detect seconds vs milliseconds
+        // Unix timestamp in seconds is ~10 digits, in milliseconds ~13 digits
+        const nowSec = BigInt(Math.floor(Date.now() / 1000));
+        const deadlineSec = deadline > 10000000000n ? deadline / 1000n : deadline;
+        const remainingSec = deadlineSec - nowSec;
+
+        if (remainingSec <= 0n) {
+            return { success: false, error: `Deadline already expired (${Number(-remainingSec)}s ago)` };
+        }
+        if (remainingSec < 60n) {
+            return { success: false, error: `Deadline too close (${Number(remainingSec)}s left, need >60s)` };
+        }
+
+        // Check NUSD balance before proceeding
+        const totalAmount = BigInt(paymentData.totalAmount);
+        const nusdContract = new ethers.Contract(NUSD_CONTRACT, NUSD_ABI, signer.provider);
+        const nusdBalance = await nusdContract.balanceOf(address);
+
+        if (nusdBalance < totalAmount) {
+            const have = ethers.formatEther(nusdBalance);
+            const need = ethers.formatEther(totalAmount);
+            return { success: false, error: `Insufficient NUSD: have ${have}, need ${need}` };
         }
 
         logger.info('Signing NUSD permit...', { context: ctx });
-        const totalAmount = BigInt(paymentData.totalAmount);
-        const permitSig = await signNusdPermit(signer, contractAddress, totalAmount, BigInt(deadline));
+        const permitSig = await signNusdPermit(signer, contractAddress, totalAmount, deadline);
 
-        logger.info('Sending on-chain transaction...', { context: ctx });
-        const tx = await paymentContract.paymentWithPermit(
+        // Build call params (17 params: 10 order fields + marketingRuleId + 3 order sig + 3 permit sig)
+        // Server signs verifySignature hash: encodePacked(params + marketingRuleId + shopContract + buyer)
+        // Contract uses verifySignature with toEthSignedMessageHash + ECDSA
+        const marketingRuleId = BigInt(paymentData.marketingRuleId || 0);
+        const callParams = [
             BigInt(paymentData.orderId), BigInt(paymentData.skuId), BigInt(paymentData.price),
             BigInt(paymentData.inventory), BigInt(paymentData.inventoryVersion), BigInt(paymentData.quantity),
-            totalAmount, BigInt(paymentData.shippingFee), BigInt(deadline), BigInt(paymentData.nonce),
+            totalAmount, BigInt(paymentData.shippingFee), deadline, BigInt(paymentData.nonce),
+            marketingRuleId,
             paymentData.v, paymentData.r, paymentData.s,
-            permitSig.v, permitSig.r, permitSig.s,
-            { gasLimit: 500000 }
-        );
+            permitSig.v, permitSig.r, permitSig.s
+        ];
+
+        // Pre-flight simulation via eth_call (catches reverts BEFORE sending tx)
+        logger.info('Simulating transaction...', { context: ctx });
+        try {
+            await paymentContract.purchaseWithMarketingAndPermit.staticCall(...callParams);
+        } catch (simError) {
+            const reason = simError.revert?.args?.[0] || simError.reason || simError.shortMessage || simError.message;
+            return { success: false, error: `Simulation failed: ${reason}` };
+        }
+
+        // Estimate gas dynamically with fallback
+        let gasLimit = 500000n;
+        try {
+            const estimated = await paymentContract.purchaseWithMarketingAndPermit.estimateGas(...callParams);
+            gasLimit = estimated * 150n / 100n; // 50% buffer
+            if (gasLimit < 300000n) gasLimit = 300000n;
+        } catch {
+            gasLimit = 500000n;
+        }
+
+        // Send actual transaction
+        logger.info('Sending on-chain transaction...', { context: ctx });
+        const tx = await paymentContract.purchaseWithMarketingAndPermit(...callParams, { gasLimit });
 
         logger.info(`Tx sent: ${tx.hash.slice(0, 16)}... confirming...`, { context: ctx });
-        const receipt = await tx.wait();
+
+        // Wait for confirmation with 120s timeout
+        const receipt = await Promise.race([
+            tx.wait(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Transaction confirmation timeout (120s)')), 120000))
+        ]);
 
         if (receipt.status === 0) return { success: false, error: 'Transaction reverted on-chain' };
         return { success: true, txHash: receipt.hash };
     } catch (error) {
-        return { success: false, error: error.shortMessage || error.reason || error.message || 'Unknown error' };
+        const msg = error.shortMessage || error.reason || error.message || 'Unknown error';
+        if (msg.includes('insufficient funds')) {
+            return { success: false, error: 'Insufficient Sepolia ETH for gas fees' };
+        }
+        if (msg.includes('nonce')) {
+            return { success: false, error: `Nonce conflict: ${msg}` };
+        }
+        return { success: false, error: msg };
     }
 }
 
@@ -889,6 +1010,19 @@ async function performPurchase(apiClient, userId, privateKey, ctx) {
 
         if (balanceNusd <= 0) return { success: false, error: 'No NUSD balance' };
 
+        // Check Sepolia ETH for gas
+        try {
+            const provider = new ethers.JsonRpcProvider(SEPOLIA_RPC);
+            const ethBal = await provider.getBalance(address);
+            const ethBalFormatted = parseFloat(ethers.formatEther(ethBal));
+            logger.info(`Sepolia ETH: ${ethBalFormatted.toFixed(4)} ETH`, { context: ctx });
+            if (ethBal < ethers.parseEther('0.0005')) {
+                return { success: false, error: `Insufficient Sepolia ETH for gas: ${ethBalFormatted.toFixed(4)} ETH` };
+            }
+        } catch (e) {
+            logger.warn(`Could not check ETH balance: ${e.message}`, { context: ctx });
+        }
+
         logger.info('Fetching product list...', { context: ctx });
         const listResult = await fetchProductList(apiClient);
         if (!listResult.success) return { success: false, error: `Product list failed: ${listResult.error}` };
@@ -907,6 +1041,9 @@ async function performPurchase(apiClient, userId, privateKey, ctx) {
         const tryOrder = [...shuffleArray(affordable.slice(0, halfIdx)), ...affordable.slice(halfIdx)];
 
         let lastError = '';
+        let consecutiveOnChainFails = 0;
+        const MAX_CONSECUTIVE_ONCHAIN_FAILS = 5;
+
         for (let i = 0; i < tryOrder.length; i++) {
             const product = tryOrder[i];
             logger.info(`[${i + 1}/${tryOrder.length}] Trying: ${product.name} (${product.price} NUSD)`, { context: ctx });
@@ -916,28 +1053,73 @@ async function performPurchase(apiClient, userId, privateKey, ctx) {
                 if (!detailResult.success) { lastError = detailResult.error; continue; }
 
                 logger.info(`Creating order (SKU: ${detailResult.skuId})...`, { context: ctx });
-                const orderResult = await createOrder(apiClient, detailResult.skuId);
+                const orderResult = await createOrder(apiClient, detailResult.skuId, detailResult.promotionId);
                 if (!orderResult.success) { lastError = orderResult.error; continue; }
 
                 logger.info(`Order created: ${orderResult.orderId}`, { context: ctx });
-                const payResult = await getPaymentData(apiClient, orderResult.orderId);
-                if (!payResult.success) { lastError = payResult.error; continue; }
 
-                const onChainResult = await executePaymentOnChain(privateKey, payResult.paymentData, ctx);
-                if (!onChainResult.success) { lastError = onChainResult.error; continue; }
+                // On-chain payment with retry (up to 2 attempts per product)
+                let onChainSuccess = false;
+                let onChainResult;
 
-                logger.success(`Tx confirmed: ${onChainResult.txHash.slice(0, 20)}...`, { context: ctx });
-                await submitOrderTx(apiClient, orderResult.orderId, onChainResult.txHash);
-                await logPurchaseActivity(apiClient, userId);
+                for (let attempt = 0; attempt < 2; attempt++) {
+                    if (attempt > 0) {
+                        logger.info(`Retrying on-chain payment (attempt ${attempt + 1})...`, { context: ctx });
+                        await delay(3000);
+                    }
 
-                return {
-                    success: true,
-                    orderId: orderResult.orderId,
-                    txHash: onChainResult.txHash,
-                    product: product.name,
-                    price: product.price,
-                    message: `Bought "${product.name}" for ${product.price.toLocaleString()} NUSD`
-                };
+                    const payResult = await getPaymentData(apiClient, orderResult.orderId);
+                    if (!payResult.success) {
+                        lastError = payResult.error;
+                        break;
+                    }
+
+                    onChainResult = await executePaymentOnChain(privateKey, payResult.paymentData, ctx);
+                    if (onChainResult.success) {
+                        onChainSuccess = true;
+                        break;
+                    }
+
+                    lastError = onChainResult.error;
+
+                    // Don't retry on non-recoverable errors
+                    if (lastError.includes('Insufficient NUSD') ||
+                        lastError.includes('Insufficient Sepolia ETH') ||
+                        lastError.includes('Deadline already expired') ||
+                        lastError.includes('Invalid deadline')) {
+                        break;
+                    }
+                }
+
+                if (onChainSuccess) {
+                    consecutiveOnChainFails = 0;
+                    logger.success(`Tx confirmed: ${onChainResult.txHash.slice(0, 20)}...`, { context: ctx });
+                    await submitOrderTx(apiClient, orderResult.orderId, onChainResult.txHash);
+                    await logPurchaseActivity(apiClient, userId);
+
+                    return {
+                        success: true,
+                        orderId: orderResult.orderId,
+                        txHash: onChainResult.txHash,
+                        product: product.name,
+                        price: product.price,
+                        message: `Bought "${product.name}" for ${product.price.toLocaleString()} NUSD`
+                    };
+                } else {
+                    consecutiveOnChainFails++;
+                    logger.warn(`On-chain failed [${consecutiveOnChainFails}/${MAX_CONSECUTIVE_ONCHAIN_FAILS}]: ${lastError}`, { context: ctx });
+
+                    // Early exit on systemic on-chain failures
+                    if (consecutiveOnChainFails >= MAX_CONSECUTIVE_ONCHAIN_FAILS) {
+                        return { success: false, error: `${consecutiveOnChainFails} consecutive on-chain failures. Last: ${lastError}` };
+                    }
+
+                    // Early exit on non-recoverable errors
+                    if (lastError.includes('Insufficient NUSD') ||
+                        lastError.includes('Insufficient Sepolia ETH')) {
+                        return { success: false, error: lastError };
+                    }
+                }
             } catch (error) { lastError = error.message; continue; }
         }
         return { success: false, error: `All ${tryOrder.length} products failed. Last: ${lastError}` };
@@ -1109,9 +1291,11 @@ async function runAccountTasks(account, index) {
     accState.faucet = '-';
     accState.purchase = '-';
     accState.review = '-';
+    accState.diffPoints = 0; // Reset diff for new run
     renderTable();
 
     let userId;
+    let initialPoints = null; // Use null to track fetch success
 
     try {
         const walletAddress = getWalletAddress(account.privateKey);
@@ -1132,6 +1316,18 @@ async function runAccountTasks(account, index) {
         // Warmup
         logger.info('Warming up...', { context: ctx });
         await warmupRequests(apiClient);
+
+        // Fetch Initial Points
+        const pointsBefore = await getUserPoints(apiClient);
+        if (pointsBefore.success) {
+            initialPoints = pointsBefore.points;
+            accState.points = initialPoints;
+            logger.info(`Initial Points: ${initialPoints}`, { context: ctx });
+        } else {
+            logger.warn(`Could not fetch initial points: ${pointsBefore.error}`, { context: ctx });
+        }
+        renderTable();
+
         await delay(DELAYS.taskDelay);
 
         // === TASK 1: Check-in ===
@@ -1208,6 +1404,25 @@ async function runAccountTasks(account, index) {
         accState.lastRun = Date.now();
         logger.success('All tasks completed!', { context: ctx });
 
+        // Fetch Final Points
+        const pointsAfter = await getUserPoints(apiClient);
+        if (pointsAfter.success) {
+            const finalPoints = pointsAfter.points;
+            accState.points = finalPoints;
+
+            if (initialPoints !== null) {
+                accState.diffPoints = finalPoints - initialPoints;
+                const sign = accState.diffPoints >= 0 ? '+' : '';
+                logger.success(`Final Points: ${finalPoints} (${sign}${accState.diffPoints})`, { context: ctx });
+            } else {
+                accState.diffPoints = '?';
+                logger.success(`Final Points: ${finalPoints}`, { context: ctx });
+            }
+        } else {
+            logger.warn(`Could not fetch final points: ${pointsAfter.error}`, { context: ctx });
+        }
+
+
     } catch (error) {
         accState.status = 'FAILED';
         accState.lastRun = Date.now();
@@ -1245,7 +1460,9 @@ async function main() {
             checkin: '-',
             faucet: '-',
             purchase: '-',
-            review: '-'
+            review: '-',
+            points: '-',
+            diffPoints: '-'
         });
     }
 
