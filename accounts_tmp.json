@@ -1,12 +1,15 @@
-[
-    {
-        "name": "Account1",
-        "privateKey": "YOUR_PRIVATE_KEY_HERE",
-        "proxy": ""
-    },
-    {
-        "name": "Account2",
-        "privateKey": "YOUR_PRIVATE_KEY_HERE",
-        "proxy": "http://user:pass@host:port"
-    }
-]
+{
+    "captchaApiKey": "YOUR_2CAPTCHA_KEY",
+    "accounts": [
+        {
+            "name": "Account1",
+            "privateKey": "YOUR_PRIVATE_KEY_HERE",
+            "proxy": "http://user:pass@ip:port"
+        },
+        {
+            "name": "Account2",
+            "privateKey": "YOUR_PRIVATE_KEY_HERE",
+            "proxy": ""
+        }
+    ]
+}

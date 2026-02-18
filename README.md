@@ -38,13 +38,16 @@ cp accounts_tmp.json accounts.json
 
 2. Edit `accounts.json` dengan data kamu:
 ```json
-[
+{
+  "captchaApiKey": "YOUR_2CAPTCHA_KEY",
+  "accounts": [
     {
-        "name": "Account1",
-        "privateKey": "YOUR_PRIVATE_KEY_HERE",
-        "proxy": ""
+      "name": "Account1",
+      "privateKey": "YOUR_PRIVATE_KEY_HERE",
+      "proxy": ""
     }
-]
+  ]
+}
 ```
 
 | Field | Keterangan |

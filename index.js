@@ -42,6 +42,7 @@ const ENDPOINTS = {
 
 const RECAPTCHA_SITE_KEY = '6LdNNtMrAAAAAMEQUOEq3UzU-fCmMuhsYtkD36Xc';
 const RECAPTCHA_SITE_URL = 'https://satsume.com';
+// Credentials are now loaded from accounts.json
 
 const DELAYS = {
     minDelay: 2000,
@@ -53,7 +54,9 @@ const DELAYS = {
 const RETRY = {
     maxRetries: 3,
     baseDelay: 1000,
-    maxDelay: 30000
+    maxDelay: 30000,
+    taskRetryCount: 3, // Retry failed tasks up to 3 times per cycle
+    cycleRetryCount: 5 // Retry failed accounts up to 5 times per day
 };
 
 const SCHEDULE_RESET_HOUR_UTC = 0;
@@ -402,11 +405,12 @@ function getBackoffDelay(attempt) {
 }
 
 class ApiClient {
-    constructor(fingerprint, proxy = null) {
+    constructor(fingerprint, proxy = null, captchaApiKey = null) {
         this.fingerprint = fingerprint;
         this.accessToken = null;
         this.proxyAgent = createProxyAgent(proxy);
         this.proxyString = proxy || '';
+        this.captchaApiKey = captchaApiKey;
     }
 
     setAccessToken(token) { this.accessToken = token; }
@@ -514,6 +518,53 @@ function getWalletAddress(privateKey) {
 }
 
 /**
+ * Solve reCAPTCHA using 2Captcha
+ */
+async function solveCaptcha(apiKey, siteKey, pageUrl) {
+    try {
+        logger.info('Solving CAPTCHA with 2Captcha...', { context: 'Captcha' });
+
+        // Step 1: Submit captcha request
+        const submitUrl = `http://2captcha.com/in.php?key=${apiKey}&method=userrecaptcha&googlekey=${siteKey}&pageurl=${pageUrl}&json=1`;
+        const submitRes = await axios.get(submitUrl);
+
+        if (submitRes.data.status !== 1) {
+            logger.error(`2Captcha submit failed: ${submitRes.data.request}`, { context: 'Captcha' });
+            return null;
+        }
+
+        const requestId = submitRes.data.request;
+        logger.info(`Captcha submitted. ID: ${requestId}. Waiting...`, { context: 'Captcha' });
+
+        // Step 2: Poll for result
+        let attempts = 0;
+        while (attempts < 30) {
+            await delay(5000); // Wait 5s
+            const fetchUrl = `http://2captcha.com/res.php?key=${apiKey}&action=get&id=${requestId}&json=1`;
+            const fetchRes = await axios.get(fetchUrl);
+
+            if (fetchRes.data.status === 1) {
+                logger.success('Captcha solved!', { context: 'Captcha' });
+                return fetchRes.data.request;
+            }
+
+            if (fetchRes.data.request !== 'CAPCHA_NOT_READY') {
+                logger.error(`2Captcha error: ${fetchRes.data.request}`, { context: 'Captcha' });
+                return null;
+            }
+
+            attempts++;
+        }
+
+        logger.error('Captcha timeout', { context: 'Captcha' });
+        return null;
+    } catch (e) {
+        logger.error(`Captcha exception: ${e.message}`, { context: 'Captcha' });
+        return null;
+    }
+}
+
+/**
  * Fetch reCAPTCHA v3 token using anchor-reload technique
  */
 async function fetchRecaptchaToken(proxy = null) {
@@ -600,9 +651,25 @@ async function getNonce(apiClient, address, proxy = null) {
         if (response && response.code === 200 && response.data) {
             return { success: true, nonce: response.data.nonce || response.data };
         }
-    } catch (e) { /* all attempts failed */ }
+    } catch (e) { /* try next approach */ }
 
-    return { success: false, error: 'Failed to obtain nonce (captcha may be required)' };
+    // Attempt 4: Use 2Captcha
+    if (apiClient.captchaApiKey) {
+        const solvedToken = await solveCaptcha(apiClient.captchaApiKey, RECAPTCHA_SITE_KEY, RECAPTCHA_SITE_URL);
+        if (solvedToken) {
+            try {
+                const endpoint = `${ENDPOINTS.loginNonce}?address=${address}&token=${encodeURIComponent(solvedToken)}`;
+                const response = await apiClient.get(endpoint, { maxRetries: 2 });
+                if (response && response.code === 200 && response.data) {
+                    return { success: true, nonce: response.data.nonce || response.data };
+                }
+            } catch (e) {
+                logger.error(`Login with 2Captcha failed: ${e.message}`, { context: 'Login' });
+            }
+        }
+    }
+
+    return { success: false, error: 'Failed to obtain nonce (captcha required and failed)' };
 }
 
 async function login(apiClient, privateKey, proxy = null) {
@@ -1038,7 +1105,10 @@ async function performPurchase(apiClient, userId, privateKey, ctx) {
         }
 
         const halfIdx = Math.max(1, Math.ceil(affordable.length * 0.5));
-        const tryOrder = [...shuffleArray(affordable.slice(0, halfIdx)), ...affordable.slice(halfIdx)];
+        // Reduce retry count to max 5 products as requested
+        const tryOrderFull = [...shuffleArray(affordable.slice(0, halfIdx)), ...affordable.slice(halfIdx)];
+        const tryOrder = tryOrderFull.slice(0, 5);
+
 
         let lastError = '';
         let consecutiveOnChainFails = 0;
@@ -1234,7 +1304,18 @@ function loadAccounts() {
     }
 
     try {
-        let accounts = JSON.parse(fs.readFileSync(accountsPath, 'utf8'));
+        let fileData = JSON.parse(fs.readFileSync(accountsPath, 'utf8'));
+        let accounts = [];
+        let captchaApiKey = null;
+
+        // Support new object format with captchaApiKey
+        if (!Array.isArray(fileData) && fileData.accounts) {
+            accounts = fileData.accounts;
+            captchaApiKey = fileData.captchaApiKey;
+        } else {
+            // Support legacy array format
+            accounts = fileData;
+        }
 
         if (typeof accounts === 'string') {
             accounts = [{ name: 'Account1', privateKey: accounts, proxy: '' }];
@@ -1243,15 +1324,20 @@ function loadAccounts() {
             accounts = accounts.map((pk, i) => ({ name: `Account${i + 1}`, privateKey: pk, proxy: '' }));
         }
 
-        const valid = accounts.filter(acc => {
-            let pk = acc.privateKey || acc.pk || acc;
-            if (typeof pk === 'string') {
-                pk = pk.trim();
-                if (!pk.startsWith('0x')) pk = '0x' + pk;
-                if (pk.length === 66) { acc.privateKey = pk; return true; }
-            }
-            return false;
-        });
+        const valid = accounts
+            .filter(acc => {
+                let pk = acc.privateKey || acc.pk || acc;
+                if (typeof pk === 'string') {
+                    pk = pk.trim();
+                    if (!pk.startsWith('0x')) pk = '0x' + pk;
+                    if (pk.length === 66) { acc.privateKey = pk; return true; }
+                }
+                return false;
+            })
+            .map(acc => ({
+                ...acc,
+                captchaApiKey: acc.captchaApiKey || captchaApiKey // Inherit global key if not set per account
+            }));
 
         if (valid.length === 0) {
             console.log(chalk.red('No valid accounts found in accounts.json'));
@@ -1302,7 +1388,7 @@ async function runAccountTasks(account, index) {
         logger.info(`Wallet: ${walletAddress.slice(0, 6)}...${walletAddress.slice(-4)}`, { context: ctx });
 
         const fingerprint = getFingerprint(walletAddress);
-        const apiClient = new ApiClient(fingerprint, account.proxy);
+        const apiClient = new ApiClient(fingerprint, account.proxy, account.captchaApiKey);
 
         // Login
         logger.info('Logging in...', { context: ctx });
@@ -1410,7 +1496,7 @@ async function runAccountTasks(account, index) {
             const finalPoints = pointsAfter.points;
             accState.points = finalPoints;
 
-            if (initialPoints !== null) {
+            if (typeof initialPoints === 'number' && typeof finalPoints === 'number') {
                 accState.diffPoints = finalPoints - initialPoints;
                 const sign = accState.diffPoints >= 0 ? '+' : '';
                 logger.success(`Final Points: ${finalPoints} (${sign}${accState.diffPoints})`, { context: ctx });
@@ -1427,9 +1513,12 @@ async function runAccountTasks(account, index) {
         accState.status = 'FAILED';
         accState.lastRun = Date.now();
         logger.error(`Error: ${error.message}`, { context: ctx });
+        renderTable();
+        return false; // Task failed
     }
 
     renderTable();
+    return true; // Task success
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1470,12 +1559,22 @@ async function main() {
     logger.info(`Loaded ${accounts.length} account(s)`, { context: 'System' });
 
     while (true) {
+        let cycleFailedAccounts = [];
+
         // Run tasks for each account
         for (let i = 0; i < accounts.length; i++) {
+            // Skip if already success in this cycle (logic for retries)
+            if (state.accounts[i].status === 'SUCCESS' && state.accounts[i].lastRun > Date.now() - 3600000) {
+                continue;
+            }
+
             state.accounts[i].status = 'PROCESSING';
             renderTable();
 
-            await runAccountTasks(accounts[i], i);
+            const success = await runAccountTasks(accounts[i], i);
+            if (!success) {
+                cycleFailedAccounts.push(i);
+            }
 
             // Delay between accounts
             if (i < accounts.length - 1) {
@@ -1484,6 +1583,35 @@ async function main() {
                 await delay(accountDelay, 0.1);
             }
         }
+
+        // Retry Logic for Failed Accounts
+        let retries = 0;
+        while (cycleFailedAccounts.length > 0 && retries < RETRY.cycleRetryCount) {
+            logger.warn(`Cycle complete. ${cycleFailedAccounts.length} failed accounts. Retrying in 2 minutes...`, { context: 'Retry' });
+            await delay(120000); // Wait 2 minutes
+
+            retries++;
+            logger.info(`Retry attempt ${retries}/${RETRY.cycleRetryCount}...`, { context: 'Retry' });
+
+            const nextFailures = [];
+            for (const idx of cycleFailedAccounts) {
+                state.accounts[idx].status = 'RETRYING';
+                renderTable();
+                const success = await runAccountTasks(accounts[idx], idx);
+                if (!success) {
+                    nextFailures.push(idx);
+                }
+                await delay(5000);
+            }
+            cycleFailedAccounts = nextFailures;
+        }
+
+        if (cycleFailedAccounts.length > 0) {
+            logger.error(`Giving up on ${cycleFailedAccounts.length} accounts after ${retries} retries.`, { context: 'System' });
+        } else {
+            logger.success('All accounts completed successfully!', { context: 'System' });
+        }
+
 
         // Calculate next run
         const nextReset = getNextResetTime();
