@@ -219,10 +219,11 @@ function renderTable() {
 
     // Summary Table
     const table = new Table({
-        head: ['Account', 'IP', 'Status', 'Points', 'Diff', 'Last Run', 'Next Run', 'Checkin', 'Faucet', 'Purchase', 'Review'],
-        colWidths: [12, 18, 12, 10, 8, 12, 12, 10, 10, 10, 10],
+        head: ['Account', 'IP', 'Status', /*'Points', 'Diff',*/ 'Last Run', 'Next Run', 'Checkin', 'Faucet', 'Purchase', 'Review'],
+        colWidths: [12, 18, 12, /*10, 8,*/ 12, 12, 10, 10, 10, 10],
         style: { head: ['cyan'], border: ['grey'] }
     });
+
 
     state.accounts.forEach(acc => {
         let statusText = acc.status;
@@ -243,22 +244,16 @@ function renderTable() {
             lastRunStr = new Date(acc.lastRun).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         }
 
-        let diffDisplay = '-';
-        if (acc.diffPoints !== undefined && acc.diffPoints !== null) {
-            if (typeof acc.diffPoints === 'number') {
-                const sign = acc.diffPoints >= 0 ? '+' : '';
-                diffDisplay = chalk.green(`${sign}${acc.diffPoints}`);
-            } else if (acc.diffPoints === '?') {
-                diffDisplay = chalk.yellow('?');
-            }
-        }
+        // let diffDisplay = '-';
+        // if (acc.diffPoints !== undefined && acc.diffPoints !== null) { ... }
+
 
         table.push([
             `Account ${acc.index}`,
             chalk.magenta(acc.ip || 'Direct'),
             statusText,
-            acc.points !== undefined ? acc.points : '-',
-            diffDisplay,
+            // acc.points !== undefined ? acc.points : '-',
+            // diffDisplay,
             lastRunStr,
             nextRunStr,
             acc.checkin || '-',
@@ -267,6 +262,7 @@ function renderTable() {
             acc.review || '-'
         ]);
     });
+
 
     console.log(table.toString());
 
@@ -1255,7 +1251,7 @@ async function performReview(apiClient, userId, orderId, ctx) {
         const ordersResult = await getReviewableOrders(apiClient);
 
         if (!ordersResult.success) {
-            if (reviewedCount > 0) return { success: true, message: `Reviewed ${reviewedCount} order(s)` };
+            if (reviewedCount > 0) return { success: true, reviewedCount, message: `Reviewed ${reviewedCount} order(s)` };
             return { success: false, error: `Fetch orders failed: ${ordersResult.error}` };
         }
 
@@ -1263,7 +1259,7 @@ async function performReview(apiClient, userId, orderId, ctx) {
         logger.info(`Found ${pendingOrders.length} unreviewed orders`, { context: ctx });
 
         if (pendingOrders.length === 0 && reviewedCount === 0) {
-            return { success: true, skipped: true, message: 'No orders pending review' };
+            return { success: true, skipped: true, reviewedCount: 0, message: 'No orders pending review' };
         }
 
         for (const order of pendingOrders) {
@@ -1286,10 +1282,11 @@ async function performReview(apiClient, userId, orderId, ctx) {
             }
         }
 
-        if (reviewedCount > 0) return { success: true, message: `Reviewed ${reviewedCount} order(s). ${lastMessage}` };
-        return { success: true, skipped: true, message: 'All orders already reviewed' };
+        if (reviewedCount > 0) return { success: true, reviewedCount, message: `Reviewed ${reviewedCount} order(s). ${lastMessage}` };
+        return { success: true, skipped: true, reviewedCount: 0, message: 'All orders already reviewed' };
     } catch (error) { return { success: false, error: error.message }; }
 }
+
 
 // ═══════════════════════════════════════════════════════════
 // ACCOUNT LOADER
@@ -1377,7 +1374,8 @@ async function runAccountTasks(account, index) {
     accState.faucet = '-';
     accState.purchase = '-';
     accState.review = '-';
-    accState.diffPoints = 0; // Reset diff for new run
+    // accState.diffPoints = 0; // Removed
+
     renderTable();
 
     let userId;
@@ -1403,15 +1401,11 @@ async function runAccountTasks(account, index) {
         logger.info('Warming up...', { context: ctx });
         await warmupRequests(apiClient);
 
-        // Fetch Initial Points
-        const pointsBefore = await getUserPoints(apiClient);
-        if (pointsBefore.success) {
-            initialPoints = pointsBefore.points;
-            accState.points = initialPoints;
-            logger.info(`Initial Points: ${initialPoints}`, { context: ctx });
-        } else {
-            logger.warn(`Could not fetch initial points: ${pointsBefore.error}`, { context: ctx });
-        }
+        // Fetch Initial Points (Removed as per request)
+        // const pointsBefore = await getUserPoints(apiClient);
+        // if (pointsBefore.success) { ... }
+        renderTable();
+
         renderTable();
 
         await delay(DELAYS.taskDelay);
@@ -1473,6 +1467,7 @@ async function runAccountTasks(account, index) {
         logger.info('Submitting review...', { context: ctx });
         const reviewResult = await performReview(apiClient, userId, purchaseResult.orderId, ctx);
 
+
         if (reviewResult.success) {
             if (reviewResult.skipped) {
                 accState.review = chalk.yellow('ALREADY');
@@ -1490,23 +1485,8 @@ async function runAccountTasks(account, index) {
         accState.lastRun = Date.now();
         logger.success('All tasks completed!', { context: ctx });
 
-        // Fetch Final Points
-        const pointsAfter = await getUserPoints(apiClient);
-        if (pointsAfter.success) {
-            const finalPoints = pointsAfter.points;
-            accState.points = finalPoints;
 
-            if (typeof initialPoints === 'number' && typeof finalPoints === 'number') {
-                accState.diffPoints = finalPoints - initialPoints;
-                const sign = accState.diffPoints >= 0 ? '+' : '';
-                logger.success(`Final Points: ${finalPoints} (${sign}${accState.diffPoints})`, { context: ctx });
-            } else {
-                accState.diffPoints = '?';
-                logger.success(`Final Points: ${finalPoints}`, { context: ctx });
-            }
-        } else {
-            logger.warn(`Could not fetch final points: ${pointsAfter.error}`, { context: ctx });
-        }
+
 
 
     } catch (error) {
